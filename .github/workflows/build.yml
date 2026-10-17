@@ -1,0 +1,100 @@
+name: Build foo_removeplayed (x64)
+
+# Runs only when you press the "Run workflow" button on the Actions tab.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Add NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Download and unpack the foobar2000 SDK (2023-04-18)
+        run: |
+          # If you uploaded your own sdk.7z to the repository, that file is used instead of downloading.
+          if (-not (Test-Path sdk.7z)) {
+            curl.exe -L --fail -A "Mozilla/5.0" -o sdk.7z "https://www.foobar2000.org/downloads/SDK-2023-04-18.7z"
+            if ($LASTEXITCODE -ne 0) {
+              curl.exe -L --fail -A "Mozilla/5.0" -o sdk.7z "https://www.foobar2000.org/getfile/SDK-2023-04-18.7z"
+              if ($LASTEXITCODE -ne 0) { throw "Could not download the SDK" }
+            }
+          }
+          & "C:\Program Files\7-Zip\7z.exe" x sdk.7z -olib\foobar2000_sdk -y
+          if ($LASTEXITCODE -ne 0) { throw "Could not unpack the SDK" }
+          # If the archive had an extra folder level, move its contents up one level.
+          if (-not (Test-Path lib\foobar2000_sdk\pfc)) {
+            $inner = Get-ChildItem lib\foobar2000_sdk -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'pfc') } | Select-Object -First 1
+            if ($inner) { Get-ChildItem $inner.FullName | Move-Item -Destination lib\foobar2000_sdk }
+          }
+          if (-not (Test-Path lib\foobar2000_sdk\pfc)) { throw "The SDK folder layout is not what was expected" }
+          Get-ChildItem lib\foobar2000_sdk
+
+      - name: Fix the WTL package path in the SDK helper project
+        run: |
+          $f = (Resolve-Path 'lib\foobar2000_sdk\foobar2000\helpers\foobar2000_sdk_helpers.vcxproj').Path
+          $t = [System.IO.File]::ReadAllText($f)
+          $t = $t.Replace('..\packages\wtl.10.0.10320', '..\..\..\..\packages\wtl.10.0.10320')
+          [System.IO.File]::WriteAllText($f, $t)
+          if (-not $t.Contains('..\..\..\..\packages\wtl.10.0.10320')) { throw "WTL path was not found in the helper project file" }
+          Select-String -Path $f -Pattern 'wtl.10.0.10320' | Select-Object -First 4
+
+      - name: Put the plugin source into the example project
+        run: |
+          New-Item -ItemType Directory -Force plugin | Out-Null
+          # If you add your own plugin\foo_removeplayed.cpp to the repository, that file is used instead of downloading.
+          if (-not (Test-Path plugin\foo_removeplayed.cpp)) {
+            curl.exe -L --fail -o plugin\foo_removeplayed.cpp "https://raw.githubusercontent.com/Chronial/foo_removeplayed/master/foo_removeplayed.cpp"
+            if ($LASTEXITCODE -ne 0) { throw "Could not download the plugin source" }
+          }
+          Write-Host "Contents of src before the swap:"
+          Get-ChildItem src
+          if (-not (Test-Path src\foo_test.cpp)) { throw "src\foo_test.cpp was not found" }
+          $orig = Get-Content src\foo_test.cpp -Raw
+          $pch = ''
+          if ($orig -match '(?m)^\s*#include\s+"stdafx\.h"') { $pch = '#include "stdafx.h"' + "`r`n" }
+          $plugin = Get-Content plugin\foo_removeplayed.cpp -Raw
+          # The old code looked for the SDK in a folder called _sdk; point it at lib\foobar2000_sdk instead.
+          $plugin = $plugin -replace '\.\.[/\\]_sdk[/\\]', '../lib/foobar2000_sdk/'
+          Set-Content -Path src\foo_test.cpp -Value ($pch + $plugin) -Encoding utf8BOM
+          Write-Host "First lines of the new src\foo_test.cpp:"
+          Get-Content src\foo_test.cpp -TotalCount 12
+
+      - name: Restore NuGet packages
+        run: nuget restore foo_test.sln
+
+      - name: Build (Release, x64)
+        run: msbuild foo_test.sln /m /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+
+      - name: Collect the DLL
+        run: |
+          $dll = Get-ChildItem -Recurse -Filter foo_test.dll | Select-Object -First 1
+          if (-not $dll) {
+            Get-ChildItem -Recurse -Filter *.dll | Select-Object -ExpandProperty FullName
+            throw "foo_test.dll was not produced"
+          }
+          Write-Host "Found: $($dll.FullName)"
+          $bytes = [System.IO.File]::ReadAllBytes($dll.FullName)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          Write-Host ("Machine type: 0x{0:X}  (0x8664 means 64-bit)" -f $machine)
+          if ($machine -ne 0x8664) { throw "The DLL is not a 64-bit build" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $dll.FullName out\foo_removeplayed.dll
+          Get-Item out\foo_removeplayed.dll
+
+      - name: Upload the result
+        uses: actions/upload-artifact@v4
+        with:
+          name: foo_removeplayed-x64
+          path: out/foo_removeplayed.dll
