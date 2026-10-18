@@ -1,4 +1,4 @@
-#define VERSION ("1.4.1-test")
+#define VERSION ("1.4.2-test")
 
 #include "../_sdk/foobar2000/SDK/foobar2000.h"
 
@@ -19,6 +19,11 @@ DECLARE_COMPONENT_VERSION( "Remove played Files", VERSION,
 __DATE__ " - " __TIME__ )
 
 metadb_handle_ptr g_current_track;
+
+// CHANGED (1.4.2): true while this component has switched on foobar2000's
+// "Stop after current" for the last remaining track (see on_playback_time).
+// Only ever touched from the main thread.
+static bool g_stop_armed = false;
 
 // {D8882A57-C32C-47b1-AE3B-016CCAA05B7C}
 static const GUID guid_removeplayed_enabled = { 0xd8882a57, 0xc32c, 0x47b1, { 0xae, 0x3b, 0x1, 0x6c, 0xca, 0xa0, 0x5b, 0x7c } };
@@ -48,9 +53,9 @@ public:
 
 	t_size playlist;
 	t_size index;
-	// CHANGED: true when playback has wrapped around onto the last remaining
-	// track (see removePlayedSong). In that case playback is stopped right
-	// after the track is removed, so it is not played a second time.
+	// Safety net from 1.4.1: true when playback has wrapped around onto the
+	// last remaining track anyway (see removePlayedSong). Playback is then
+	// stopped right after the track is removed, so it is not played twice.
 	bool stopAfterRemoval;
 
 	void callback_run(){
@@ -58,7 +63,6 @@ public:
 		const bit_array_one del(index);
 		pm->playlist_remove_items(playlist,del);
 		RP_LOG("foo_removeplayed: removed item %u from playlist %u (stop afterwards: %d)", (unsigned)index, (unsigned)playlist, stopAfterRemoval ? 1 : 0);
-		// CHANGED: stop playback if the removed track was the only one left.
 		if (stopAfterRemoval){
 			static_api_ptr_t<playback_control> pc;
 			pc->stop();
@@ -66,16 +70,62 @@ public:
 	}
 };
 
+// CHANGED (1.4.2): switches foobar2000's "Stop after current" on or off.
+// playback_control must not be used from inside play callbacks, so this
+// runs as a main thread callback.
+class stop_flag_callback : public main_thread_callback {
+public:
+	stop_flag_callback() : arm(false) {}
+	bool arm;
+
+	void callback_run(){
+		static_api_ptr_t<playback_control> pc;
+		if (arm){
+			// Leave it alone if the user has already switched it on themselves.
+			if (!pc->get_stop_after_current()){
+				pc->set_stop_after_current(true);
+				g_stop_armed = true;
+			}
+		} else if (g_stop_armed){
+			// Only ever switch off what this component switched on.
+			pc->set_stop_after_current(false);
+			g_stop_armed = false;
+		}
+		RP_LOG("foo_removeplayed: stop-after-current is now %d (set by this component: %d)", pc->get_stop_after_current() ? 1 : 0, g_stop_armed ? 1 : 0);
+	}
+};
+
 class my_play_callback : public play_callback_static {
 public:
 	my_play_callback(){
 		trackSkipped = false;
+		lastTime = 0;
+		stopRequested = false;
 	}
 private:
 	double lastTime;
 	bool trackSkipped;
+	// CHANGED (1.4.2): true while we have asked for "Stop after current"
+	// because the playing track is the only one left in its playlist.
+	bool stopRequested;
 
-	// CHANGED: newTrackStarting is true when this is called from on_playback_new_track().
+	// CHANGED (1.4.2): asks the main thread to switch our "Stop after current" request on or off.
+	void requestStopAfterCurrent(bool arm){
+		static_api_ptr_t<main_thread_callback_manager> cm;
+		service_ptr_t<stop_flag_callback> callback = new service_impl_t<stop_flag_callback>;
+		callback->arm = arm;
+		RP_LOG("foo_removeplayed: %s stop-after-current", arm ? "requesting" : "releasing");
+		cm->add_callback(callback);
+	}
+
+	// CHANGED (1.4.2): true if the current track was within its last 2 seconds.
+	bool playedToTheEnd(){
+		if (!(g_current_track != 0)) return false;
+		const double length = g_current_track->get_length();
+		return length > 0 && (lastTime + 2.0) >= length;
+	}
+
+	// newTrackStarting is true when called from on_playback_new_track().
 	void removePlayedSong(bool newTrackStarting = false){
 		if ((!trackSkipped && cfg_removeplayed_enabled) || (trackSkipped && cfg_removeskipped_enabled)){
 			t_size playlist;
@@ -92,7 +142,7 @@ private:
 					callback->index = songIndex;
 					callback->playlist = playlist;
 
-					// CHANGED: the fix for the replay of the last track.
+					// Safety net from 1.4.1 for the replay of the last track.
 					// When a new track starts, the previous track is still in the playlist.
 					// If the playlist holds only that one track, the "new" track is that same
 					// track coming round again (shuffle and repeat modes never run out of
@@ -114,27 +164,47 @@ public:
 	//! Controls which methods your callback wants called; returned value should not change in run time, you should expect it to be queried only once (on startup). See play_callback::flag_* constants.
 	virtual unsigned get_flags(){
 		return play_callback::flag_on_playback_new_track
-			//| play_callback::flag_on_playback_time
+			| play_callback::flag_on_playback_time // CHANGED (1.4.2): needed to watch for the last remaining track
 			| play_callback::flag_on_playback_stop;
 	};
 
 	//! Playback advanced to new track.
 	virtual void on_playback_new_track(metadb_handle_ptr p_track){
 		RP_LOG("foo_removeplayed: on_playback_new_track");
-		removePlayedSong(true); // CHANGED: tell it a new track is starting
+		removePlayedSong(true); // tell it a new track is starting
 		g_current_track = p_track;
-		//lastTime = 0;
+		lastTime = 0;
+		// CHANGED (1.4.2): a request made for the previous track must not carry over.
+		if (stopRequested){
+			stopRequested = false;
+			requestStopAfterCurrent(false);
+		}
 	};
 
 	//! Playback stopped.
 	virtual void on_playback_stop(play_control::t_stop_reason p_reason){
 		RP_LOG("foo_removeplayed: on_playback_stop, reason %d", (int)p_reason);
+
+		// CHANGED (1.4.2): never let our "Stop after current" outlive this playback session.
+		const bool wasRequested = stopRequested;
+		if (stopRequested || g_stop_armed){
+			requestStopAfterCurrent(false);
+		}
+		stopRequested = false;
+
 		// was last song in playlist
 		if (p_reason == play_control::stop_reason_eof){
 			trackSkipped = false;
 			removePlayedSong();
 		} else if (p_reason == play_control::stop_reason_starting_another){
 			trackSkipped = true;
+			removePlayedSong();
+		} else if (wasRequested && playedToTheEnd()){
+			// CHANGED (1.4.2): "Stop after current" may be reported with a different
+			// reason than end-of-file. If it was our request and the track was
+			// essentially finished, treat it as played.
+			RP_LOG("foo_removeplayed: treating this stop as the end of the last track");
+			trackSkipped = false;
 			removePlayedSong();
 		} else {
 			g_current_track = 0;
@@ -143,8 +213,25 @@ public:
 
 	//! Called every second, for time display
 	virtual void on_playback_time(double p_time){
-		/*static_api_ptr_t<playback_control> pc;
-		lastTime = p_time;*/
+		lastTime = p_time;
+
+		// CHANGED (1.4.2): if the playing track is the only one left in its playlist,
+		// ask for "Stop after current". Otherwise foobar2000 (in shuffle and repeat
+		// modes) would start that same track again once it ends. This is checked every
+		// second, so the request is withdrawn as soon as more tracks are added.
+		bool wantStop = false;
+		if (cfg_removeplayed_enabled){
+			t_size playlist;
+			t_size songIndex;
+			static_api_ptr_t<playlist_manager> pm;
+			if (pm->get_playing_item_location(&playlist,&songIndex)){
+				wantStop = (pm->playlist_get_item_count(playlist) == 1);
+			}
+		}
+		if (wantStop != stopRequested){
+			stopRequested = wantStop;
+			requestStopAfterCurrent(wantStop);
+		}
 	};
 
 	virtual void on_playback_starting(play_control::t_track_command p_command,bool p_paused){};
