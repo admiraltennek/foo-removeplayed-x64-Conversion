@@ -6,7 +6,7 @@
 
 // CHANGED: diagnostic messages in foobar2000's console (View > Console).
 // Set RP_DEBUG to 0 once everything works to silence them.
-#define RP_DEBUG 1
+#define RP_DEBUG 0
 #if RP_DEBUG
 #define RP_LOG(...) console::printf(__VA_ARGS__)
 #else
