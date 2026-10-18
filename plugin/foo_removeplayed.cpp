@@ -1,4 +1,4 @@
-#define VERSION ("1.4.2-test")
+#define VERSION ("1.4.3-test")
 
 #include "../_sdk/foobar2000/SDK/foobar2000.h"
 
@@ -12,6 +12,8 @@
 #else
 #define RP_LOG(...) ((void)0)
 #endif
+// CHANGED (1.4.3): milliseconds shown in every log line, so the order and spacing of events can be seen.
+#define RP_NOW ((unsigned)(GetTickCount() % 100000))
 
 DECLARE_COMPONENT_VERSION( "Remove played Files", VERSION,
 "Removes played files from playlist\n"
@@ -62,7 +64,7 @@ public:
 		static_api_ptr_t<playlist_manager> pm;
 		const bit_array_one del(index);
 		pm->playlist_remove_items(playlist,del);
-		RP_LOG("foo_removeplayed: removed item %u from playlist %u (stop afterwards: %d)", (unsigned)index, (unsigned)playlist, stopAfterRemoval ? 1 : 0);
+		RP_LOG("foo_removeplayed [%u]: removed item %u from playlist %u (stop afterwards: %d)", RP_NOW, (unsigned)index, (unsigned)playlist, stopAfterRemoval ? 1 : 0);
 		if (stopAfterRemoval){
 			static_api_ptr_t<playback_control> pc;
 			pc->stop();
@@ -91,7 +93,7 @@ public:
 			pc->set_stop_after_current(false);
 			g_stop_armed = false;
 		}
-		RP_LOG("foo_removeplayed: stop-after-current is now %d (set by this component: %d)", pc->get_stop_after_current() ? 1 : 0, g_stop_armed ? 1 : 0);
+		RP_LOG("foo_removeplayed [%u]: stop-after-current is now %d (set by this component: %d)", RP_NOW, pc->get_stop_after_current() ? 1 : 0, g_stop_armed ? 1 : 0);
 	}
 };
 
@@ -114,7 +116,7 @@ private:
 		static_api_ptr_t<main_thread_callback_manager> cm;
 		service_ptr_t<stop_flag_callback> callback = new service_impl_t<stop_flag_callback>;
 		callback->arm = arm;
-		RP_LOG("foo_removeplayed: %s stop-after-current", arm ? "requesting" : "releasing");
+		RP_LOG("foo_removeplayed [%u]: %s stop-after-current", RP_NOW, arm ? "requesting" : "releasing");
 		cm->add_callback(callback);
 	}
 
@@ -126,7 +128,10 @@ private:
 	}
 
 	// newTrackStarting is true when called from on_playback_new_track().
-	void removePlayedSong(bool newTrackStarting = false){
+	// CHANGED (1.4.3): returns true if a removal was queued; itemCountOut (optional)
+	// then receives the number of items the playlist held at that moment.
+	bool removePlayedSong(bool newTrackStarting = false, t_size * itemCountOut = 0){
+		bool queued = false;
 		if ((!trackSkipped && cfg_removeplayed_enabled) || (trackSkipped && cfg_removeskipped_enabled)){
 			t_size playlist;
 			t_size songIndex;
@@ -149,15 +154,18 @@ private:
 					// tracks). It is about to be removed, so stop playback after removing it.
 					const t_size itemCount = pm->playlist_get_item_count(playlist);
 					callback->stopAfterRemoval = newTrackStarting && (itemCount <= 1);
+					if (itemCountOut) *itemCountOut = itemCount;
 
-					RP_LOG("foo_removeplayed: queued removal of item %u in playlist %u (items in playlist: %u, skipped: %d, stop afterwards: %d)",
-						(unsigned)songIndex, (unsigned)playlist, (unsigned)itemCount, trackSkipped ? 1 : 0, callback->stopAfterRemoval ? 1 : 0);
+					RP_LOG("foo_removeplayed [%u]: queued removal of item %u in playlist %u (items in playlist: %u, skipped: %d, stop afterwards: %d)",
+						RP_NOW, (unsigned)songIndex, (unsigned)playlist, (unsigned)itemCount, trackSkipped ? 1 : 0, callback->stopAfterRemoval ? 1 : 0);
 
 					cm->add_callback(callback);
+					queued = true;
 				}
 			}
 		}
 		trackSkipped = false;
+		return queued;
 	}
 
 public:
@@ -170,8 +178,9 @@ public:
 
 	//! Playback advanced to new track.
 	virtual void on_playback_new_track(metadb_handle_ptr p_track){
-		RP_LOG("foo_removeplayed: on_playback_new_track");
-		removePlayedSong(true); // tell it a new track is starting
+		RP_LOG("foo_removeplayed [%u]: on_playback_new_track", RP_NOW);
+		t_size itemCount = 0;
+		const bool removalQueued = removePlayedSong(true, &itemCount); // tell it a new track is starting
 		g_current_track = p_track;
 		lastTime = 0;
 		// CHANGED (1.4.2): a request made for the previous track must not carry over.
@@ -179,11 +188,20 @@ public:
 			stopRequested = false;
 			requestStopAfterCurrent(false);
 		}
+		// CHANGED (1.4.3): the finished track is being removed. If the playlist held just
+		// that track and this one, this is now the last track, so ask for "Stop after
+		// current" immediately instead of waiting for the next one-second tick. Short
+		// tracks can otherwise be too late: foobar2000 may already have decided what
+		// plays next. (The request is queued after the removal, so it runs after it.)
+		if (removalQueued && itemCount == 2){
+			stopRequested = true;
+			requestStopAfterCurrent(true);
+		}
 	};
 
 	//! Playback stopped.
 	virtual void on_playback_stop(play_control::t_stop_reason p_reason){
-		RP_LOG("foo_removeplayed: on_playback_stop, reason %d", (int)p_reason);
+		RP_LOG("foo_removeplayed [%u]: on_playback_stop, reason %d", RP_NOW, (int)p_reason);
 
 		// CHANGED (1.4.2): never let our "Stop after current" outlive this playback session.
 		const bool wasRequested = stopRequested;
@@ -203,7 +221,7 @@ public:
 			// CHANGED (1.4.2): "Stop after current" may be reported with a different
 			// reason than end-of-file. If it was our request and the track was
 			// essentially finished, treat it as played.
-			RP_LOG("foo_removeplayed: treating this stop as the end of the last track");
+			RP_LOG("foo_removeplayed [%u]: treating this stop as the end of the last track", RP_NOW);
 			trackSkipped = false;
 			removePlayedSong();
 		} else {
