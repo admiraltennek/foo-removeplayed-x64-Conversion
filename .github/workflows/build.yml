@@ -1,4 +1,4 @@
-name: Build foo_removeplayed (x64)
+name: Build foo_removeplayed (x86 and x64)
 
 # Runs only when you press the "Run workflow" button on the Actions tab.
 on:
@@ -6,7 +6,26 @@ on:
 
 jobs:
   build:
+    name: build (${{ matrix.label }})
     runs-on: windows-2022
+    strategy:
+      # If one architecture fails, the other still finishes and keeps its result.
+      fail-fast: false
+      matrix:
+        include:
+          - label: x64
+            platform: x64
+            machine: '8664'
+            cl: ''
+          - label: x86
+            platform: Win32
+            machine: '14C'
+            # Ask the SDK for foobar2000 v1.5/v1.6 compatibility mode (target version 80)
+            # so the 32-bit build is not tied to foobar2000 v2.0 or newer.
+            cl: '/DFOOBAR2000_TARGET_VERSION=80'
+    env:
+      # The compiler reads extra options from this variable. Empty for x64 (no change there).
+      CL: ${{ matrix.cl }}
     defaults:
       run:
         shell: pwsh
@@ -73,8 +92,8 @@ jobs:
       - name: Restore NuGet packages
         run: nuget restore foo_test.sln
 
-      - name: Build (Release, x64)
-        run: msbuild foo_test.sln /m /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+      - name: Build (Release, ${{ matrix.label }})
+        run: msbuild foo_test.sln /m /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
 
       - name: Collect the DLL
         run: |
@@ -87,8 +106,9 @@ jobs:
           $bytes = [System.IO.File]::ReadAllBytes($dll.FullName)
           $pe = [BitConverter]::ToInt32($bytes, 0x3C)
           $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
-          Write-Host ("Machine type: 0x{0:X}  (0x8664 means 64-bit)" -f $machine)
-          if ($machine -ne 0x8664) { throw "The DLL is not a 64-bit build" }
+          $expected = [Convert]::ToInt32('${{ matrix.machine }}', 16)
+          Write-Host ("Machine type: 0x{0:X}  (expected 0x{1:X} for ${{ matrix.label }}; 0x14C = 32-bit, 0x8664 = 64-bit)" -f $machine, $expected)
+          if ($machine -ne $expected) { throw "The DLL is not a ${{ matrix.label }} build" }
           New-Item -ItemType Directory -Force out | Out-Null
           Copy-Item $dll.FullName out\foo_removeplayed.dll
           Get-Item out\foo_removeplayed.dll
@@ -96,5 +116,5 @@ jobs:
       - name: Upload the result
         uses: actions/upload-artifact@v4
         with:
-          name: foo_removeplayed-x64
+          name: foo_removeplayed-${{ matrix.label }}
           path: out/foo_removeplayed.dll
